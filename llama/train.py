@@ -39,14 +39,14 @@ DEFAULT_UNK_TOKEN = "<unk>"
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    model_name_or_path: Optional[str] = field(default="openlm-research/open_llama_3b")
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(
-        default=512,
+        default=2048,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
 
@@ -96,14 +96,24 @@ def smart_tokenizer_and_embedding_resize(
 
 def tokenize_fn(tokenizer, example):
     context_length = tokenizer.model_max_length
-    outputs = tokenizer(
-        tokenizer.eos_token.join(example["text"]),
-        truncation=False,
-        return_tensors="pt",
-        pad_to_multiple_of=context_length,
-        padding=True,
-    )
-    return {"input_ids": outputs["input_ids"].view(-1, context_length)}
+    prompt = example["prompt"]
+    generation = example["generation"]
+
+    # Tokenize prompt and generation separately
+    prompt_tokens = tokenizer(prompt, truncation=True, padding="longest_first")
+    generation_tokens = tokenizer(generation, truncation=True, padding="longest_first")
+
+    # Combine the tokens
+    combined_tokens = {
+        key: value + generation_tokens[key]
+        for key, value in prompt_tokens.items()
+    }
+
+    # Adjust the combined tokens to the desired context length
+    combined_tokens = tokenizer.pad(combined_tokens, return_tensors="pt", pad_to_multiple_of=context_length)
+
+    return {"input_ids": combined_tokens["input_ids"].view(-1, context_length)}
+
 
 def add_mem_tokens(example, mem_freq, mem_id):
     x = example["input_ids"]
@@ -142,6 +152,13 @@ def train():
         special_tokens_dict["bos_token"] = DEFAULT_BOS_TOKEN
     if tokenizer.unk_token is None:
         special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
+    
+    special_tokens = ["<|system|>", "<|model|>", "<|user|>"]
+    for token in special_tokens:
+        if token not in tokenizer.vocab:
+            tokenizer.add_tokens(token)
+            special_tokens_dict.setdefault("additional_special_tokens", []).append(token)
+            
     mem_token = "<landmark>"
     special_tokens_dict["additional_special_tokens"] = [mem_token]
 
@@ -158,7 +175,7 @@ def train():
         barrier()
     dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", cache_dir=training_args.cache_dir)
 
-    dataset = dataset.map(partial(tokenize_fn,tokenizer),batched=True, num_proc=32, remove_columns=["text", "meta"])
+    dataset = dataset.map(partial(tokenize_fn,tokenizer),batched=True, num_proc=32, remove_columns=["identifier"])
 
     dataset = dataset.map(
         partial(
